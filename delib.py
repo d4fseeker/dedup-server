@@ -92,10 +92,10 @@ class DelibBackup:
     def finish(self,size):
         self.data._DBFinishBackup(host=self.host,name=self.name,size=size)
 
-    def link(self,pos,hash):
+    def link(self,pos,hash,do_commit=True):
         if not hash:
             raise Exception("Hash is not defined")
-        self.data._DBLinkBackupHash(self.id,hash,pos)
+        self.data._DBLinkBackupHash(self.id,hash,pos,do_commit=do_commit)
 
 class DelibRestore:
 
@@ -150,7 +150,7 @@ class DelibDataDir:
     def getBlocksize(self):
         return self.settings["blocksize"]
 
-    def addBlock(self,block):
+    def addBlock(self,block,do_commit=True):
         if not isinstance(block,DelibBlock):
             raise TypeError("Must be DelibBlock, not {}".format(type(block)))
         #Skip existing hashes
@@ -166,7 +166,7 @@ class DelibDataDir:
             fcntl.lockf(fp,fcntl.LOCK_EX | fcntl.LOCK_NB)
             #Write hash
             block.writeFP(fp, compressed=True)
-            self._DBAddBlock(filename,block)
+            self._DBAddBlock(filename,block,do_commit=do_commit)
         return True
 
     def getBlockByHash(self,hash):
@@ -193,7 +193,7 @@ class DelibDataDir:
     ## Override for other database engines
     ##
 
-    def _DBAddBlock(self,filename,block):
+    def _DBAddBlock(self,filename,block,do_commit=True):
         self.cur.execute("INSERT INTO blocks (hash,size,csize,compressed,filename,time_imported) VALUES (:hash,:size,:csize,:compressed,:filename,:time)", {
             "hash": block.getHash(),
             "size": block.getSize(),
@@ -202,7 +202,8 @@ class DelibDataDir:
             "filename": filename ,
             "time": int(time.time())
         })
-        self.db.commit()
+        if do_commit:
+            self._DBCommit()
 
     def _DBGetBlock(self,hash):
         row = self.cur.execute("SELECT * FROM blocks WHERE hash = :hash",{ "hash": hash }).fetchone()
@@ -258,9 +259,10 @@ class DelibDataDir:
             raise Exception("No backup with host {} and name {}".format(host,name))
         return res["ROWID"]
 
-    def _DBLinkBackupHash(self,backup,hash,pos):
+    def _DBLinkBackupHash(self,backup,hash,pos,do_commit=True):
         self.cur.execute("INSERT INTO backup_blocks (pos,block,backup) VALUES ( :pos , :block , :backup )", { "pos": pos, "backup": backup, "block": hash })
-        self.db.commit()
+        if do_commit:
+            self._DBCommit()
 
     def _DBHashExists(self,myhash):
         return ( self.cur.execute("SELECT COUNT(rowid) FROM blocks WHERE hash = :hash",{"hash": myhash}).fetchone()[0] > 0 )
@@ -271,6 +273,9 @@ class DelibDataDir:
         for row in self.cur:
             hashes.append(row["hash"])
         return hashes
+
+    def _DBCommit(self):
+        self.db.commit()
 
 
     def _DBOpen(self):

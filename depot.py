@@ -20,6 +20,8 @@ class Depot(Delib):
     SKIP_KNOWN_BLOCKS_ENTIRELY = True   #Skips verifying a known-blocks hash
     SKIP_VERIFYING_BLOCKS = True        #Skips verifying if a block actually has the given hash
                                         #WARNING: Turning on SKIP_VERIFYING_BLOCKS will prevent trasport corruption or malformed blocks from being detected!
+    DELAY_DB_BLOCK_COMMIT = True        #Runs a single commit at the end for all new blocks
+    DELAY_DB_LINK_COMMIT = True         #Runs a single commit at the end for all backup links
 
     STATE_HEADER = 1
     STATE_BODY = 2
@@ -63,6 +65,9 @@ class Depot(Delib):
                     #Check if we reached footer
                     matches = re.search("^\/newblocks\/([a-zA-Z0-9]{1,})\.(lz4|tar)$",tarinfo.name)
                     if not matches:
+                        #Commit body blocks before continuing
+                        if self.DELAY_DB_BLOCK_COMMIT:
+                            self.data._DBCommit()
                         logging.info("TAR-body done")
                         self.state += 1
                     else:
@@ -83,7 +88,7 @@ class Depot(Delib):
                             if client_hash != block.getHash():
                                 raise Exception("Client hash {} differs from server hash {} for block {}".format(client_hash,block.getHash(),tarinfo.name))
                             #Store block
-                            self.data.addBlock(block)
+                            self.data.addBlock(block,do_commit=(not self.DELAY_DB_BLOCK_COMMIT))
                         else:
                             #logging.debug("Skipping known block {} entirely. Fast mode".format(client_hash))
                             pass
@@ -96,16 +101,18 @@ class Depot(Delib):
                     k,v = self.extractTarHeader(tarinfo,self.need_footers)
                     self.need_footers.remove(tarinfo.name)
                     if len(self.need_footers) == 0:
+                        logging.info("TAR complete. Linking backup.")
                         self.state += 1
                         #Add backup links
                         hash_pos = 1
                         for myhash in self.tar["backup_list"].splitlines():
                             #logging.debug("Linking hash {}".format(myhash))
-                            self.backup.link(hash_pos,myhash)
+                            self.backup.link(hash_pos,myhash,do_commit=(not self.DELAY_DB_LINK_COMMIT))
                             hash_pos += 1
                         #Finish backup
+                        self.backup.data._DBCommit()
                         self.backup.finish(size=self.tar["backup_filesize"])
-                        logging.info("TAR-footer done")
+                        logging.info("Backup linked and finished.")
                         break
 
 
