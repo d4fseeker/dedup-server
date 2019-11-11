@@ -55,6 +55,11 @@ Show backups of a single host:
 Returns a newline-separated list of all hashes in datadir on STDOUT. Used by dedup.py on STDIN.
 > python3 depot-list-hashes.py --dir /path/to/datadir
 
+## depot-verify.py
+Checks for each block in the database if it is on disk, decompresses it and verifies if the hash is correct.
+Any failed hashes are reported and all backups using failed hashes are marked as "broken".
+> python3 depot-verify.py --dir /path/to/datadir
+
 ## dedup-restore.py
 Streams the original file/blockdevice contents on STDOUT.
 > python3 dedup-restore.py --dir /path/to/datadir --host example.com --name backup_name
