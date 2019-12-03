@@ -1,5 +1,5 @@
 """
-Depot-List-Hashes - Datastore hash list
+Depot-List-Hashes - Datastore hash list, newline separated
 """
 
 import argparse,humanfriendly,logging,os       #Helpers
@@ -16,7 +16,7 @@ class DepotList(Delib):
     def __init__(self,dir):
         logging.info("Datastore directory {}".format(dir))
         self.data = DelibDataDir(dir)
-        for hash in self.data._DBHashList():
+        for hash in self.data.DBHashList():
             print(hash)
 
 

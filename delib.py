@@ -1,5 +1,5 @@
 import sqlite3,re #Server
-import sys,os,stat,io,struct,socket,time,fcntl #Python3 libraries
+import sys,os,stat,io,struct,socket,time,fcntl,glob #Python3 libraries
 import xxhash,lz4.frame,tarfile #Dedup
 import humanfriendly, logging, math #Helpers
 #from tqdm import tqdm #Progress bar
@@ -10,12 +10,14 @@ import humanfriendly, logging, math #Helpers
 class DelibBlock:
 
     @classmethod
-    def fromCompressed(cls,cblock,hash=None):
+    #Load block from compressed variable
+    def fromCompressed(cls,data,cblock,hash=None):
         block = lz4.frame.decompress(cblock)
         return cls(block,hash)
 
     @classmethod
-    def fromFile(cls,file,compressed):
+    #Load block from filesystem by path
+    def fromFile(cls,data,file,compressed):
         with open(file,"rb") as fp:
             block = fp.read()
         if compressed:
@@ -26,39 +28,87 @@ class DelibBlock:
         else:
             return cls(block)
 
-    def __init__(self,block,hash=None):
+    @classmethod
+    #Load block from filesystem by filename
+    def fromHash(cls,data,hash):
+        row_block = data.DBGetBlock(hash)
+        path = data.dir+"/blocks/"+row_block["filename"]
+        return cls.fromFile(cls,data,path,row_block["compressed"])
+
+    hash = None
+    cblock = None
+
+    #Init block
+    def __init__(self,data,block,hash=None):
+        self.data = data
         self.block = block
         if hash:
             self.hash = hash
         else:
             self.getHash()
 
-    hash = None
+    #Save block to disk
+    def save(self,compressed,skip_saved=True):
+        #Skip existing hashes
+        if self.data.hashExists(self.getHash()):
+            logging.debug("Skipping existing block %s", block.getHash())
+            return False
+        #Open file and verify system-wide hash lock
+        filename = block.getHash()+".lz4"
+        filepath = self.dir+"/blocks/"+filename
+        if os.path.exists(filepath):
+            raise Exception("Cannot create block file. File already exists: {}".format(filepath))
+        block.writeToFile(fp, compressed=True, locked=True)
+        #Add to database and optionally commit
+        self.cur.execute("INSERT INTO blocks (hash,size,csize,compressed,filename,time_imported) VALUES (:hash,:size,:csize,:compressed,:filename,:time)", {
+            "hash": block.getHash(),
+            "size": block.getSize(),
+            "csize": block.getCompressedSize(),
+            "compressed": "lz4",
+            "filename": filename ,
+            "time": int(time.time())
+        })
+        if do_commit:
+            self.db.commit()
+        return True
+
+
+    #Get block hash. If not defined, calculate
     def getHash(self,update=False):
         if not self.hash or update:
             self.hash = xxhash.xxh64(self.block).hexdigest()
         return self.hash
 
+
+    #Get uncompressed blocks size
     def getSize(self):
         return len(self.block)
 
-    cblock = None
+
+    #Get compressed block
     def getCompressed(self):
         if not self.cblock:
             self.cblock = lz4.frame.compress(self.block)
         return self.cblock
 
+
+    #Get size of block when compressed
     def getCompressedSize(self):
         return len(self.getCompressed())
 
-    def writeTo(self,path,compressed=True):
+
+    #Write block to given path. Optionally compressed and exclusive-locked
+    def writeToFile(self,path,compressed=True,locked=False):
         if os.path.exists(path):
             raise Exception("Cannot write block {}: File exists in path {}".format(self.getHash(),path))
         with open(path,"wb") as fp:
+            fcntl.lockf(fp,fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.writeFP(fp,compressed)
         return True
 
-    def writeFP(self,fp,compressed=True):
+
+    #Write block to given filepointer. Optionally compressed
+    def writeToFP(self,fp,compressed=True):
         if compressed:
             fp.write(self.getCompressed())
         else:
@@ -83,217 +133,163 @@ class DelibBlock:
 
 class DelibBackup:
 
-    def __init__(self,data,host,name,device,time_created):
-        self.host = host
-        self.name = name
-        self.data = data
-        self.id = self.data._DBCreateBackup(host=host,name=name,device=device,time_created=time_created)
-
-    def finish(self,size):
-        self.data._DBFinishBackup(host=self.host,name=self.name,size=size)
-
-    def link(self,pos,hash,do_commit=True):
-        if not hash:
-            raise Exception("Hash is not defined")
-        self.data._DBLinkBackupHash(self.id,hash,pos,do_commit=do_commit)
-
-class DelibRestore:
-
-    def __init__(self,data,host,name):
-        self.data = data
-        self.name = name
-        self.host = host
-        backup_id = self.data._DBGetBackupId(host,name)
-        self.db_blocks = self.data._DBGetBackupBlocks(backup_id)
-
-    def __iter__(self):
-        return DelibRestoreIterator(self)
-
-class DelibRestoreIterator:
-
-    def __init__(self,restore):
-        self.restore = restore
-        self._index = 0
-        self._lastid = len(self.restore.db_blocks)
-
-    def __next__(self):
-        if self._index >= self._lastid:
-            raise StopIteration
-        row = self.restore.db_blocks[self._index]
-        path = self.restore.data.dir + "/blocks/" + row["filename"]
-        self._index += 1
-        is_compressed = bool(len(row["compressed"]))
-        return DelibBlock.fromFile(path,compressed=is_compressed)
-
-
-
-
-
-class DelibDataDir:
-
+    #Backup States
     STATE_PENDING = "pending"       #Backup is currently being created. Check time_imported to detect stale
     STATE_READY = "ready"           #Backup is completed. time_imported is updated when backup changes to ready
     STATE_FAILED = "failed"         #Backup failed or is stale
     STATE_BROKEN = "broken"         #Backup is affected by data corruption, data loss or other causes for a broken backup
     STATE_DELETED = "deleted"       #Backup has been deleted. Cleanup has not necessarily been run yet!
 
-    NAME_DB = "db.sqlite3"
-
-    def __init__(self,dir,create_blocksize=False):
-        self.dir = dir
-        self.settings = {}
-        if create_blocksize:
-            self._DBCreate(create_blocksize)
-        else:
-            self._DBOpen()
-
-    def getBlocksize(self):
-        return self.settings["blocksize"]
-
-    def addBlock(self,block,do_commit=True):
-        if not isinstance(block,DelibBlock):
-            raise TypeError("Must be DelibBlock, not {}".format(type(block)))
-        #Skip existing hashes
-        if self._DBHashExists(block.getHash()):
-            logging.debug("Skipping existing block {}".format(block.getHash()))
-            return False
-        #Open file and verify system-wide hash lock
-        filename = block.getHash()+".lz4"
-        filepath = self.dir+"/blocks/"+filename
-        if os.path.exists(filepath):
-            raise Exception("Cannot create block file. File already exists: {}".format(filepath))
-        with open(filepath,"wb") as fp:
-            fcntl.lockf(fp,fcntl.LOCK_EX | fcntl.LOCK_NB)
-            #Write hash
-            block.writeFP(fp, compressed=True)
-            self._DBAddBlock(filename,block,do_commit=do_commit)
-        return True
-
-    def getBlockByHash(self,hash):
-        row_block = self._DBGetBlock(hash)
-        with open(self.dir+"/blocks/"+row_block["filename"]) as fp:
-            rawblock = fp.read()
-        if row_block["compressed"]:
-            block = DelibBlock.fromCompressed(rawblock,hash)
-        else:
-            block = DelibBlock(rawblock,hash)
-        return block
-
-    def removeBlockByHash(self,hash):
-        ## TODO: implement later
-        pass
-
-    def hashExists(self,hash):
-        #Proxy for self._DBHashExists()
-        return self._DBHashExists(hash)
-
-
     ##
-    ## DATABASE-specific backend
-    ## Override for other database engines
+    ## STATIC
     ##
-
-    def _DBAddBlock(self,filename,block,do_commit=True):
-        self.cur.execute("INSERT INTO blocks (hash,size,csize,compressed,filename,time_imported) VALUES (:hash,:size,:csize,:compressed,:filename,:time)", {
-            "hash": block.getHash(),
-            "size": block.getSize(),
-            "csize": block.getCompressedSize(),
-            "compressed": "lz4",
-            "filename": filename ,
-            "time": int(time.time())
-        })
-        if do_commit:
-            self._DBCommit()
-
-    def _DBGetBlock(self,hash):
-        row = self.cur.execute("SELECT * FROM blocks WHERE hash = :hash",{ "hash": hash }).fetchone()
-        if not row:
-            raise Exception("No such block in database: {}".format(hash))
-        return row
-
-    def _DBCreateBackup(self,host,name,device,time_created):
-        self.cur.execute("INSERT INTO backups (name,host,device,time_created,time_imported,state) VALUES (:name,:host,:device,:time_created,:time_imported,:state)",{
+    @classmethod
+    def create(cls,data,host,name,device,time_created):
+        data.cur.execute("INSERT INTO backups (name,host,device,time_created,time_imported,state) VALUES (:name,:host,:device,:time_created,:time_imported,:state)",{
             "name": name,
             "host": host,
             "device": device,
             "time_created": time_created,
             "time_imported": int(time.time()),
-            "state": self.STATE_PENDING
+            "state": cls.STATE_PENDING
         })
-        self.db.commit()
-        return self.cur.lastrowid
+        data.db.commit()
+        return data.cur.lastrowid
 
-    def _DBFinishBackup(self,host,name,size):
-        self._DBVerifyBackup(host=host,name=name)
-        self.cur.execute("UPDATE backups SET time_imported = :time_imported, state = :state, size = :size WHERE host = :host AND name = :name",{
+    @classmethod
+    def fromName(cls,data,host,name):
+        row = self.data.cur.execute("SELECT * FROM backups WHERE host = :host AND name = :id",{"host":host,"name":name}).fetchone()
+        if not row:
+            raise Exception("No backup with host {} and name {}".format(host,name))
+        return cls(data,row["rowid"])
+
+
+    ##
+    ## INSTANCE
+    ##
+
+    def __init__(self,data,id,row=None):
+        self.data = data
+        self.id = id
+        if not row:
+            self.refreshRow()
+        else:
+            self.row = row
+
+    #(Re)load from DB
+    def refreshRow(self):
+        self.row = self.data.cur.execute("SELECT * FROM backups WHERE id = :id",{"id":self.id}).fetchone()
+        if not self.row:
+            raise Exception("No backup with id {}".format(self.id))
+        return self.row
+
+    #Mark a backup with state pending as state ready. Optionally (default) verifies backup database consistency first.
+    def finish(self,size,doVerify=True,doReload=True):
+        #Verify if backup is STATE_PENDING
+        if doReload:
+            self.refreshRow()
+        if not self.row["state"] == self.STATE_PENDING:
+            raise Exception("Cannot mark a backup with state {} as {}".format(self.row["state"],self.STATE_READY))
+        #Verify if backup is db-sane
+        if doVerify:
+            if not self.verify():
+                raise Exception("Backup failed verification. Marking as {}".format(self.STATE_FAILED))
+        #Mark as done
+        self.cur.execute("UPDATE backups SET time_imported = :time_imported, state = :state, size = :size WHERE host = :host AND name = :name AND state = :state_pending",{
             "host": host,
             "name": name,
             "size": size,
             "time_imported": int(time.time()),
-            "state": self.STATE_READY
+            "state": self.STATE_READY,
+            "state_pending": self.STATE_PENDING
         })
+        if self.cur.rowcount != 1:
+            raise Exception("Unknown error; database failed to update. Wrong state or backup does not exist?")
         self.db.commit()
 
-    #Check if:
-    # - backup size corresponds to blocks * blocksize
-    # - blocks are continous and start at 1
-    def _DBVerifyBackup(self,host,name):
-        #TODO
-        pass
+
+    #Returns a backup size if the backup size has already been defined. Otherwise returns null
+    def getSize(self):
+        return self.row["size"]
 
 
-    def _DBGetBackupHashes(self,backup):
+    #Get backup ID
+    def getId():
+        return self.row["rowid"]
+
+
+    #Run a set of backup verifications
+    def verify(self,size=None):
+        #Check if size is defined or at least has been provided
+        if not size:
+            size = self.getSize()
+        if not size:
+            raise Exception("Backup has no size defined and no size has been provided.")
+        #Run checks
+        self.verify_continuity(size)
+
+
+    #Verify backup db continuity and size
+    def verify_continuity(self,size):
+        #Iterate through database
+        iter = self.cur.execute("SELECT bl.hash,bb.pos,ba.rowid FROM backups ba LEFT JOIN backup_blocks bb ON ba.rowid = bb.backup LEFT JOIN blocks bl ON bb.block = bl.hash WHERE ba.rowid = :backup_id ORDER BY bb.pos ASC",{"backup_id":self.getId()})
+        expect_pos = 1
+        for row in iter:
+            if row["pos"] != expect_pos:
+                logging.warn("Backup %s misses pos %s",self.getId(),expect_pos)
+            expect_pos += 1
+        expect_size = expect_pos * self.data.getBlocksize()
+        if expect_size != size:
+            raise Exception("Backup is shorter than expected. Is {}, should be {}".format(expect_size,size))
+        return True
+
+
+    #Link a hash to this backup at position pos
+    def link(self,pos,hash,do_commit=True):
+        if not hash:
+            raise Exception("Hash is not defined")
+        self.cur.execute("INSERT INTO backup_blocks (pos,block,backup) VALUES ( :pos , :block , :backup )", { "pos": pos, "backup": backup, "block": hash })
+        if do_commit:
+            self.db.commit()
+
+    #Get hashes in a backup in a ordered list
+    def getHashes(self):
         list = []
-        self.cur.execute("SELECT block FROM backup_blocks WHERE backup = :backup ORDER BY pos ASC", { "backup": backup })
+        self.data.cur.execute("SELECT block FROM backup_blocks WHERE backup = :backup ORDER BY pos ASC", { "backup": self.id })
         for row in self.cur:
             list.append(row)
         return list
 
-    def _DBGetBackupBlocks(self,backup):
-        list = []
-        return self.cur.execute("SELECT b.*,bb.pos FROM backup_blocks bb LEFT JOIN blocks b ON bb.block = b.hash ORDER BY bb.pos ASC").fetchall()
-
-    def _DBGetBackupId(self,host,name):
-        res = self.cur.execute("SELECT ROWID FROM backups WHERE host = :host AND name = :name",{ "host": host, "name": name }).fetchone()
-        if not res:
-            raise Exception("No backup with host {} and name {}".format(host,name))
-        return res["ROWID"]
-
-    def _DBLinkBackupHash(self,backup,hash,pos,do_commit=True):
-        self.cur.execute("INSERT INTO backup_blocks (pos,block,backup) VALUES ( :pos , :block , :backup )", { "pos": pos, "backup": backup, "block": hash })
-        if do_commit:
-            self._DBCommit()
-
-    def _DBHashExists(self,myhash):
-        return ( self.cur.execute("SELECT COUNT(rowid) FROM blocks WHERE hash = :hash",{"hash": myhash}).fetchone()[0] > 0 )
-
-    def _DBHashList(self):
-        hashes = []
-        self.cur.execute("SELECT hash FROM blocks ORDER BY hash ASC")
-        for row in self.cur:
-            hashes.append(row["hash"])
-        return hashes
-
-    def _DBCommit(self):
-        self.db.commit()
+    #Iterate over the backup
+    def __iter__(self):
+        return DelibBackupIterator(self)
 
 
-    def _DBOpen(self):
-        db_path = self.dir+"/"+self.NAME_DB
-        #Pre-run Sanity check
-        if not os.path.isfile(db_path):
-            raise Exception("Cannot open datastore: does not exist in {}".format(db_path))
-        #Open/Create database
-        self.db = sqlite3.connect(db_path)
-        self.db.row_factory = sqlite3.Row
-        #self.db.set_trace_callback(logging.debug) #DEBUG DB
-        self.cur = self.db.cursor()
-        #Load settings
-        for row in self.db.execute("SELECT key,value FROM settings"):
-            self.settings[row["key"]] = row["value"]
+class DelibBackupIterator:
 
-    def _DBCreate(self,blocksize):
-        db_path = self.dir+"/"+self.NAME_DB
+    def __init__(self,backup):
+        self.backup = backup
+        self.hashes = self.backup.getHashes()
+        self._index = 0
+        self._lastid = len(self.hashes)
+
+    def __next__(self):
+        if self._index >= self._lastid:
+            raise StopIteration
+        block = DelibBlock.fromHash(self.backup.data,self.hashes[self._index])
+        self._index += 1
+        return block
+
+
+class DelibDataDir:
+
+    #Database name to expect inside data dir
+    DB_NAME = "db.sqlite3"
+
+    #Create a new datadir
+    @classmethod
+    def create(cls,dir,blocksize):
+        db_path = dir+"/"+cls.DB_NAME
         #Pre-run Sanity check
         if os.path.isfile(db_path):
             raise Exception("Cannot create datastore: already exists in {}".format(db_path))
@@ -318,6 +314,86 @@ class DelibDataDir:
         self.cur.execute("INSERT INTO settings(key,value) VALUES ('blocksize',{});".format(blocksize))
         self.db.commit()
         logging.info("Done creating database")
+        #Return created datadir
+        return cls(dir)
+
+
+    def __init__(self,dir):
+        self.dir = dir
+        self.settings = {}
+        self._DBOpen()
+
+    #Return defined blocksize
+    def getBlocksize(self):
+        return self.settings["blocksize"]
+
+    #Check whether given hash exists in database
+    def hashExists(self,myhash):
+        return ( self.cur.execute("SELECT COUNT(rowid) FROM blocks WHERE hash = :hash",{"hash": myhash}).fetchone()[0] > 0 )
+
+
+    #Get list of all hashes in DB
+    def getHashes(self):
+        hashes = []
+        self.cur.execute("SELECT hash FROM blocks ORDER BY hash ASC")
+        for row in self.cur:
+            hashes.append(row["hash"])
+        return hashes
+
+    ##
+    ## DATABASE-commands
+    ##
+
+    #Get full row for block from DB
+    def DBGetBlock(self,hash):
+        row = self.cur.execute("SELECT * FROM blocks WHERE hash = :hash",{ "hash": hash }).fetchone()
+        if not row:
+            raise Exception("No such block in database: {}".format(hash))
+        return row
+
+    #Get full row for all blocks from DB
+    def DBGetBlock(self,hash):
+        rows = []
+        self.cur.execute("SELECT * FROM blocks ORDER BY hash ASC",{ "hash": hash })
+        for row in self.cur:
+            rows.append(row)
+        return rows
+
+
+    #Open database
+    def _DBOpen(self):
+        db_path = self.dir+"/"+self.DB_NAME
+        #Pre-run Sanity check
+        if not os.path.isfile(db_path):
+            raise Exception("Cannot open datastore: does not exist in {}".format(db_path))
+        #Open/Create database
+        self.db = sqlite3.connect(db_path)
+        self.db.row_factory = sqlite3.Row
+        #self.db.set_trace_callback(logging.debug) #DEBUG DB
+        self.cur = self.db.cursor()
+        #Load settings
+        for row in self.db.execute("SELECT key,value FROM settings"):
+            self.settings[row["key"]] = row["value"]
+
+    ##
+    ## BADBLOCK Management
+    # Bad blocks have a filename <HASH>.<EXTENSION>.<TIMESTAMP>.broken
+    #
+    # Note that several versions of a broken block could be in the folder over time;
+    # either with the same or different content
+    ##
+
+    #Get full filename of all broken hashes.
+    def BBgetFiles(self):
+        return glob.glob(self.dir+"/damaged/*.broken")
+
+    #Return only broken hashes. Warning: a non-broken hash may exist in blocks folder!
+    def BBgetHashes(self):
+        hashes = []
+        for file in self.BBgetFiles():
+            hash = re.search("^\w+",file)
+            hashes.append(hash)
+        return hashes
 
 
 class Delib:
@@ -328,13 +404,18 @@ class Delib:
 
     host = None
     name = None
+    data = None
 
-    def __init__(self,datadir,host=None,name=None):
-        self.host = host
-        self.name = name
-        if not isinstance(datadir,DelibDataDir):
-            raise TypeError("Must be type DelibDataDir, not {}".format(type(datadir)))
-        self.data = datadir
+    #Datadir handling
+    def getData(dir=None):
+        logging.info("Datastore directory %s",dir)
+        if dir:
+            self.dir = dir
+        if not self.data and not self.dir:
+            raise Exception("dir must be defined on first getData()")
+        if not self.data:
+            self.data = DelibDataDir(dir)
+        return self.data
 
     ##
     ## STDio handling
@@ -373,9 +454,9 @@ class Delib:
         fp = self.fp.extractfile(tarinfo)
         v = fp.read().decode("utf-8")
         if k == "backup_list":
-            logging.debug("Config: {} = {}".format(k,"[...]"))
+            logging.debug("Config: %s = %s",k,"[...]")
         else:
-            logging.debug("Config: {} = {}".format(k,v))
+            logging.debug("Config: %s = %s",k,v)
         self.tar[k] = v
         return k,v
 
@@ -383,7 +464,7 @@ class Delib:
     def verifyTarHeaders(self):
         if self.tar["backup_blocksize"] != self.data.getBlocksize():
             raise Exception("Tar blocksize {} differs from datastore blocksize {}".format(self.tar["backup_blocksize"],self.data.bs))
-        logging.debug("Verified backup blocksize {} ok".format(self.tar["backup_blocksize"]))
+        logging.debug("Verified backup blocksize %s ok",self.tar["backup_blocksize"])
 
 
 
