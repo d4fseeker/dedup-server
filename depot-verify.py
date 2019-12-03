@@ -89,10 +89,10 @@ class DepotVerify(Delib):
         return bad_backups
 
     def _markBrokenBackups(self,backup_refs):
-        logging.warn("Marking %d broken backups as failed.",len(backup_refs))
+        logging.warn("Marking %d broken backups as such.",len(backup_refs))
         for backup_ref in backup_refs:
             logging.info("Marking %s:%s as failed",backup_ref["host"],backup_ref["name"])
-            self.data.cur.execute("UPDATE backups SET state = 'failed' WHERE host = :host AND name = :name", {'host': backup_ref["host"], 'name': backup_ref["name"] } )
+            self.data.cur.execute("UPDATE backups SET state = 'broken' WHERE host = :host AND name = :name", {'host': backup_ref["host"], 'name': backup_ref["name"] } )
             self.data.db.commit()
         logging.info("Done marking broken backups")
 
@@ -104,7 +104,6 @@ def parse_arguments():
     )
      argparse_logging.add_log_level_argument(parser)
      parser.add_argument("--dir",required=True,help="Datablock directory")
-     parser.add_argument("-loglevel",default="info",help="Changes loglevel to debug")
      parser.add_argument("--dry",action="store_true",help="Dry-run. Do not move or mark damaged elements.")
      parser.add_argument("--skip-blocks",action="store_true",help="Skip individual block checking")
      parser.add_argument("--skip-backups",action="store_true",help="Skip backup->block completion check")
