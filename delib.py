@@ -13,7 +13,7 @@ class DelibBlock:
     #Load block from compressed variable
     def fromCompressed(cls,data,cblock,hash=None):
         block = lz4.frame.decompress(cblock)
-        return cls(block,hash)
+        return cls(data,block,hash)
 
     @classmethod
     #Load block from filesystem by path
@@ -22,18 +22,22 @@ class DelibBlock:
             block = fp.read()
         if compressed:
             try:
-                return cls.fromCompressed(block)
+                return cls.fromCompressed(data,cblock=block)
             except RuntimeError as e:
                 raise Exception("Decompression failed for {}. {}".format(file,str(e)))
         else:
             return cls(block)
 
+
     @classmethod
     #Load block from filesystem by filename
     def fromHash(cls,data,hash):
-        row_block = data.DBGetBlock(hash)
-        path = data.dir+"/blocks/"+row_block["filename"]
-        return cls.fromFile(cls,data,path,row_block["compressed"])
+        try:
+            row_block = data.DBGetBlock(hash)
+            path = data.dir+"/blocks/"+row_block["filename"]
+            return cls.fromFile(data=data,file=path,compressed=row_block["compressed"])
+        except Exception as e:
+            raise Exception("Failed to fetch block {}. Reason: {}".format(path,str(e)))
 
     hash = None
     cblock = None
@@ -139,6 +143,7 @@ class DelibBackup:
     STATE_FAILED = "failed"         #Backup failed or is stale
     STATE_BROKEN = "broken"         #Backup is affected by data corruption, data loss or other causes for a broken backup
     STATE_DELETED = "deleted"       #Backup has been deleted. Cleanup has not necessarily been run yet!
+    ALL_STATES = [ STATE_PENDING, STATE_READY,STATE_FAILED,STATE_BROKEN,STATE_DELETED]
 
     ##
     ## STATIC
@@ -158,7 +163,7 @@ class DelibBackup:
 
     @classmethod
     def fromName(cls,data,host,name):
-        row = self.data.cur.execute("SELECT * FROM backups WHERE host = :host AND name = :id",{"host":host,"name":name}).fetchone()
+        row = data.cur.execute("SELECT rowid FROM backups WHERE host = :host AND name = :name",{"host":host,"name":name}).fetchone()
         if not row:
             raise Exception("No backup with host {} and name {}".format(host,name))
         return cls(data,row["rowid"])
@@ -178,7 +183,7 @@ class DelibBackup:
 
     #(Re)load from DB
     def refreshRow(self):
-        self.row = self.data.cur.execute("SELECT * FROM backups WHERE id = :id",{"id":self.id}).fetchone()
+        self.row = self.data.cur.execute("SELECT rowid,* FROM backups WHERE rowid = :id",{"id":self.id}).fetchone()
         if not self.row:
             raise Exception("No backup with id {}".format(self.id))
         return self.row
@@ -195,7 +200,7 @@ class DelibBackup:
             if not self.verify():
                 raise Exception("Backup failed verification. Marking as {}".format(self.STATE_FAILED))
         #Mark as done
-        self.cur.execute("UPDATE backups SET time_imported = :time_imported, state = :state, size = :size WHERE host = :host AND name = :name AND state = :state_pending",{
+        self.data.cur.execute("UPDATE backups SET time_imported = :time_imported, state = :state, size = :size WHERE host = :host AND name = :name AND state = :state_pending",{
             "host": host,
             "name": name,
             "size": size,
@@ -203,9 +208,9 @@ class DelibBackup:
             "state": self.STATE_READY,
             "state_pending": self.STATE_PENDING
         })
-        if self.cur.rowcount != 1:
+        if self.data.cur.rowcount != 1:
             raise Exception("Unknown error; database failed to update. Wrong state or backup does not exist?")
-        self.db.commit()
+        self.data.db.commit()
 
 
     #Returns a backup size if the backup size has already been defined. Otherwise returns null
@@ -214,7 +219,7 @@ class DelibBackup:
 
 
     #Get backup ID
-    def getId():
+    def getId(self):
         return self.row["rowid"]
 
 
@@ -229,28 +234,39 @@ class DelibBackup:
         self.verify_continuity(size)
 
 
-    #Verify backup db continuity and size
-    def verify_continuity(self,size):
+    #Verify backup db continuity and size by checking:
+    # - Continuity
+    # - Length
+    # - If all referenced blocks exist in DB (Not on disk!)
+    def verify_continuity(self,size=None,throw_exception=True):
+        has_err = False
+        if not size:
+            size = self.getSize()
         #Iterate through database
-        iter = self.cur.execute("SELECT bl.hash,bb.pos,ba.rowid FROM backups ba LEFT JOIN backup_blocks bb ON ba.rowid = bb.backup LEFT JOIN blocks bl ON bb.block = bl.hash WHERE ba.rowid = :backup_id ORDER BY bb.pos ASC",{"backup_id":self.getId()})
+        iter = self.data.cur.execute("SELECT bl.hash,bb.pos,ba.rowid FROM backups ba LEFT JOIN backup_blocks bb ON ba.rowid = bb.backup LEFT JOIN blocks bl ON bb.block = bl.hash WHERE ba.rowid = :backup_id ORDER BY bb.pos ASC",{"backup_id":self.getId()})
         expect_pos = 1
         for row in iter:
             if row["pos"] != expect_pos:
-                logging.warn("Backup %s misses pos %s",self.getId(),expect_pos)
+                logging.error("Backup %s misses pos %s",self.getId(),expect_pos)
+                has_err = True
             expect_pos += 1
-        expect_size = expect_pos * self.data.getBlocksize()
+        expect_size = (expect_pos-1) * self.data.getBlocksize()
         if expect_size != size:
-            raise Exception("Backup is shorter than expected. Is {}, should be {}".format(expect_size,size))
-        return True
+            has_err = True
+            logging.error("Backup is shorter than expected. Is %d, should be %d",expect_size,size)
+
+        if throw_exception:
+            raise Exception("Backup {} is damaged!".format(self.getId()))
+        return not has_err
 
 
     #Link a hash to this backup at position pos
     def link(self,pos,hash,do_commit=True):
         if not hash:
             raise Exception("Hash is not defined")
-        self.cur.execute("INSERT INTO backup_blocks (pos,block,backup) VALUES ( :pos , :block , :backup )", { "pos": pos, "backup": backup, "block": hash })
+        self.data.cur.execute("INSERT INTO backup_blocks (pos,block,backup) VALUES ( :pos , :block , :backup )", { "pos": pos, "backup": backup, "block": hash })
         if do_commit:
-            self.db.commit()
+            self.data.db.commit()
 
     #Get hashes in a backup in a ordered list
     def getHashes(self):
@@ -325,7 +341,7 @@ class DelibDataDir:
 
     #Return defined blocksize
     def getBlocksize(self):
-        return self.settings["blocksize"]
+        return int(self.settings["blocksize"])
 
     #Check whether given hash exists in database
     def hashExists(self,myhash):
@@ -340,6 +356,17 @@ class DelibDataDir:
             hashes.append(row["hash"])
         return hashes
 
+    #Get list of tuples {host,name} from database, limited by provided state (all states by default)
+    def getBackupsByState(self,state=DelibBackup.ALL_STATES):
+        return self.cur.execute("SELECT host,name FROM backups WHERE state = :state",{"state":state}).fetchall()
+
+    #Get 2d-dict of state -> tuples {host,name} from database
+    def getBackups(self):
+        backups = {}
+        for state in DelibBackup.ALL_STATES:
+            backups[state] = self.getBackupsByState(state)
+        return backups
+
     ##
     ## DATABASE-commands
     ##
@@ -352,12 +379,16 @@ class DelibDataDir:
         return row
 
     #Get full row for all blocks from DB
-    def DBGetBlock(self,hash):
+    def DBGetBlocks(self,hash):
         rows = []
         self.cur.execute("SELECT * FROM blocks ORDER BY hash ASC",{ "hash": hash })
         for row in self.cur:
             rows.append(row)
         return rows
+
+    #Get filename for hash from DB
+    def DBGetFilename(self,hash):
+        return self.DBGetBlock(hash)["filename"]
 
 
     #Open database
@@ -377,7 +408,7 @@ class DelibDataDir:
 
     ##
     ## BADBLOCK Management
-    # Bad blocks have a filename <HASH>.<EXTENSION>.<TIMESTAMP>.broken
+    # Bad blocks have a filename <HASH>.<EXTENSION>.<TIMESTAMP-EPOCH>.broken
     #
     # Note that several versions of a broken block could be in the folder over time;
     # either with the same or different content
@@ -407,7 +438,7 @@ class Delib:
     data = None
 
     #Datadir handling
-    def getData(dir=None):
+    def getData(self,dir=None):
         logging.info("Datastore directory %s",dir)
         if dir:
             self.dir = dir
@@ -465,22 +496,3 @@ class Delib:
         if self.tar["backup_blocksize"] != self.data.getBlocksize():
             raise Exception("Tar blocksize {} differs from datastore blocksize {}".format(self.tar["backup_blocksize"],self.data.bs))
         logging.debug("Verified backup blocksize %s ok",self.tar["backup_blocksize"])
-
-
-
-    ##
-    ## DATASTORE handling
-    ##
-
-    data = None
-    def loadDataStore(self,dir):
-        if self.data:
-            raise Exception("Datastore already loaded")
-        self.data = DelibData(dir)
-        return self.data
-
-    def createDataStore(self,dir,bs):
-        if self._datastore:
-            raise Exception("Datastore already created")
-        self.data = DelibData(dir,bs)
-        return self.data
