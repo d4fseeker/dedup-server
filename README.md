@@ -12,7 +12,7 @@ Dedup blocks are split by a predefined blocksize which must be identical for all
 ## Installation
 Dependencies in Centos/Redhat 7/8  (Server and client)
 > yum install python3 python3-pip
-> pip3 install tqdm xxhash lz4 humanfriendly
+> pip3 install tqdm xxhash lz4 humanfriendly argparse-logging
 
 Dependencies in Debian:
 #TODO

@@ -4,12 +4,8 @@
 Depot-Verify - Datastore hash <-> block validation
 """
 
-import argparse,humanfriendly,logging,os,shutil       #Helpers
+import argparse,argparse_logging,humanfriendly,logging,os,shutil,time,sys       #Helpers
 from delib import Delib,DelibBlock,DelibBackup    #Dedup-Server
-
-LOGLEVEL=logging.DEBUG
-logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s', level=LOGLEVEL, datefmt='%Y-%m-%d %H:%M:%S')
-
 
 class DepotVerify(Delib):
 
@@ -17,11 +13,15 @@ class DepotVerify(Delib):
 
     def __init__(self,dir,dry=False):
         self.dry = dry
+        if self.dry:
+            logging.warn("Dry mode. Will not apply any changes! This results in damaged blocks not reporting corresponding backups")
         self.getData(dir)
 
     #Process checking
     def process(self,skip_check_blocks=False,skip_check_backups=False):
         logging.info("Starting process()")
+        bad_backups = None
+        bad_blocks = None
         if not skip_check_blocks:
             bad_blocks = self.verifyBlocks()
             if not self.dry and len(bad_blocks):
@@ -31,6 +31,7 @@ class DepotVerify(Delib):
             if not self.dry and len(bad_backups):
                 self._markBrokenBackups(bad_backups)
         logging.info("Finished process()")
+        return not (bad_blocks or bad_backups)
 
 
     #Verify bad blocks and return list of bad blocks
@@ -63,9 +64,12 @@ class DepotVerify(Delib):
             #Remove DB entry
             logging.info("Removing blocks entry in DB")
             self.data.db.execute("DELETE FROM blocks WHERE hash = :hash",{"hash": hash})
-            logging.info("Moving %s to %s",orig_file,dst_file)
             #Move file and finalize with commit
-            shutil.move(orig_file,dst_file)
+            if os.path.isfile(orig_file):
+                logging.info("Moving %s to %s",orig_file,dst_file)
+                shutil.move(orig_file,dst_file)
+            else:
+                logging.info("Block %s does not exist. Skipping",orig_file)
             self.data.db.commit() #Commit immediately to minimize inconsistenices
         logging.info("Done moving broken blocks")
 
@@ -89,13 +93,18 @@ class DepotVerify(Delib):
         for backup_ref in backup_refs:
             logging.info("Marking %s:%s as failed",backup_ref["host"],backup_ref["name"])
             self.data.cur.execute("UPDATE backups SET state = 'failed' WHERE host = :host AND name = :name", {'host': backup_ref["host"], 'name': backup_ref["name"] } )
+            self.data.db.commit()
         logging.info("Done marking broken backups")
 
 
 
 def parse_arguments():
-     parser = argparse.ArgumentParser()
+     parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter,description=
+        "Verifies datastore health by checking:\n** blocks for corruption and missing files\n** backups for missing blocks, continuity and size.\nRC=1 on new errors, otherwise RC=0"
+    )
+     argparse_logging.add_log_level_argument(parser)
      parser.add_argument("--dir",required=True,help="Datablock directory")
+     parser.add_argument("-loglevel",default="info",help="Changes loglevel to debug")
      parser.add_argument("--dry",action="store_true",help="Dry-run. Do not move or mark damaged elements.")
      parser.add_argument("--skip-blocks",action="store_true",help="Skip individual block checking")
      parser.add_argument("--skip-backups",action="store_true",help="Skip backup->block completion check")
@@ -104,8 +113,11 @@ def parse_arguments():
 
 
 if __name__ == "__main__":
-    logging.debug("Called: __main__")
+    LOGLEVEL=logging.INFO
+    logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s', level=LOGLEVEL, datefmt='%Y-%m-%d %H:%M:%S')
+
     args = parse_arguments()
-    logging.info("Starting DepotVerify()")
     depot_verify = DepotVerify(dir=args.dir,dry=args.dry)
-    depot_verify.process(skip_check_blocks=args.skip_blocks,skip_check_backups=args.skip_backups)
+    check = depot_verify.process(skip_check_blocks=args.skip_blocks,skip_check_backups=args.skip_backups)
+    if not check:
+        sys.exit(1)

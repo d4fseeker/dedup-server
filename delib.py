@@ -223,17 +223,6 @@ class DelibBackup:
         return self.row["rowid"]
 
 
-    #Run a set of backup verifications
-    def verify(self,size=None):
-        #Check if size is defined or at least has been provided
-        if not size:
-            size = self.getSize()
-        if not size:
-            raise Exception("Backup has no size defined and no size has been provided.")
-        #Run checks
-        self.verify_continuity(size)
-
-
     #Verify backup db continuity and size by checking:
     # - Continuity
     # - Length
@@ -243,9 +232,12 @@ class DelibBackup:
         if not size:
             size = self.getSize()
         #Iterate through database
-        iter = self.data.cur.execute("SELECT bl.hash,bb.pos,ba.rowid FROM backups ba LEFT JOIN backup_blocks bb ON ba.rowid = bb.backup LEFT JOIN blocks bl ON bb.block = bl.hash WHERE ba.rowid = :backup_id ORDER BY bb.pos ASC",{"backup_id":self.getId()})
+        iter = self.data.cur.execute("SELECT bl.hash,bb.pos,bb.block,ba.rowid FROM backups ba LEFT JOIN backup_blocks bb ON ba.rowid = bb.backup LEFT JOIN blocks bl ON bb.block = bl.hash WHERE ba.rowid = :backup_id ORDER BY bb.pos ASC",{"backup_id":self.getId()})
         expect_pos = 1
         for row in iter:
+            if not row["hash"]:
+                logging.error("Backup %s misses block %s on pos %d",self.getId(),row["block"],expect_pos)
+                has_err = True 
             if row["pos"] != expect_pos:
                 logging.error("Backup %s misses pos %s",self.getId(),expect_pos)
                 has_err = True
