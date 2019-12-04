@@ -237,7 +237,7 @@ class DelibBackup:
         for row in iter:
             if not row["hash"]:
                 logging.error("Backup %s misses block %s on pos %d",self.getId(),row["block"],expect_pos)
-                has_err = True 
+                has_err = True
             if row["pos"] != expect_pos:
                 logging.error("Backup %s misses pos %s",self.getId(),expect_pos)
                 has_err = True
@@ -297,30 +297,42 @@ class DelibDataDir:
     #Create a new datadir
     @classmethod
     def create(cls,dir,blocksize):
+        #
+        # Create files and folders
+        #
+        if not os.path.isdir(dir):
+            raise Exception("Datadir is not a folder: {}".format(dir))
+        if os.listdir(dir):
+            raise Exception("Datadir path is not empty: {}".format(dir))
+        os.mkdir(dir+"/blocks")
+        os.mkdir(dir+"/damaged")
+        #
+        #Create database
+        #
         db_path = dir+"/"+cls.DB_NAME
         #Pre-run Sanity check
         if os.path.isfile(db_path):
             raise Exception("Cannot create datastore: already exists in {}".format(db_path))
         #Open/Create database
-        self.db = sqlite3.connect(db_path)
-        self.db.row_factory = sqlite3.Row
-        self.cur = self.db.cursor()
+        db = sqlite3.connect(db_path)
+        db.row_factory = sqlite3.Row
+        cur = db.cursor()
         #Create
         logging.info("Creating database")
         logging.debug("Creating table settings")
-        self.cur.execute("CREATE TABLE settings(key TEXT, value TEXT)")
+        cur.execute("CREATE TABLE settings(key TEXT, value TEXT)")
         #Blocks
         logging.debug("Creating table blocks")
-        self.cur.execute("CREATE TABLE blocks(hash TEXT PRIMARY KEY ,size INTEGER,csize INTEGER, compressed TEXT, filename TEXT, time_imported INTEGER)")
+        cur.execute("CREATE TABLE blocks(hash TEXT PRIMARY KEY ,size INTEGER,csize INTEGER, compressed TEXT, filename TEXT, time_imported INTEGER)")
         #Backups
         logging.debug("Creating table backups")
-        self.cur.execute("CREATE TABLE backups(name TEXT, host TEXT, device TEXT, size INTEGER, time_created INTEGER, time_imported INTEGER, state TEXT CHECK( state IN ('pending','ready','failed','broken','deleted') ), UNIQUE(host,name) ) ")
+        cur.execute("CREATE TABLE backups(name TEXT, host TEXT, device TEXT, size INTEGER, time_created INTEGER, time_imported INTEGER, state TEXT CHECK( state IN ('pending','ready','failed','broken','deleted') ), UNIQUE(host,name) ) ")
         #Backup->Blocks
         logging.debug("Creating table backup_blocks")
-        self.cur.execute("CREATE TABLE backup_blocks(pos INTEGER,  block NOT NULL REFERENCES blocks, backup NOT NULL REFERENCES backups)")
+        cur.execute("CREATE TABLE backup_blocks(pos INTEGER,  block NOT NULL REFERENCES blocks, backup NOT NULL REFERENCES backups)")
         #Data and commit
-        self.cur.execute("INSERT INTO settings(key,value) VALUES ('blocksize',{});".format(blocksize))
-        self.db.commit()
+        cur.execute("INSERT INTO settings(key,value) VALUES ('blocksize',:blocksize)",{"blocksize":blocksize})
+        db.commit()
         logging.info("Done creating database")
         #Return created datadir
         return cls(dir)
