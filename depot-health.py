@@ -72,9 +72,9 @@ def parse_arguments():
         "Reports current datastore health by reporting:\n** backups marked as failed / broken\n** damaged blocks\nRC=1 if anything is broken, otherwise RC=0"
     )
      argparse_logging.add_log_level_argument(parser)
-     parser.add_argument("--dir",required=True,help="Datablock directory")
-     parser.add_argument("--skip-blocks",action="store_true",help="Skip individual block checking")
-     parser.add_argument("--skip-backups",action="store_true",help="Skip backup checking")
+     parser.add_argument("-d","--dir",required=True,help="Datablock directory")
+     parser.add_argument("-b","--skip-blocks",action="store_true",help="Skip individual block checking")
+     parser.add_argument("-a","--skip-backups",action="store_true",help="Skip backup checking")
      args = parser.parse_args()
      return args
 

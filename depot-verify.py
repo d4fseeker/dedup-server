@@ -103,10 +103,10 @@ def parse_arguments():
         "Verifies datastore health by checking:\n** blocks for corruption and missing files\n** backups for missing blocks, continuity and size.\nRC=1 on new errors, otherwise RC=0"
     )
      argparse_logging.add_log_level_argument(parser)
-     parser.add_argument("--dir",required=True,help="Datablock directory")
-     parser.add_argument("--dry",action="store_true",help="Dry-run. Do not move or mark damaged elements.")
-     parser.add_argument("--skip-blocks",action="store_true",help="Skip individual block checking")
-     parser.add_argument("--skip-backups",action="store_true",help="Skip backup->block completion check")
+     parser.add_argument("-d","--dir",required=True,help="Datablock directory")
+     parser.add_argument("-n","--dry",action="store_true",help="Dry-run. Do not move or mark damaged elements.")
+     parser.add_argument("-b","--skip-blocks",action="store_true",help="Skip individual block checking")
+     parser.add_argument("-a","--skip-backups",action="store_true",help="Skip backup->block completion check")
      args = parser.parse_args()
      return args
 
