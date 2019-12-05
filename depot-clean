@@ -94,7 +94,7 @@ def parse_arguments():
         "Cleans up database inconsistencies caused by failed and removed backus.\nRemoves orphaned blocks from database and filesystem."
      )
      argparse_logging.add_log_level_argument(parser)
-     parser.add_argument("-d","--dir",required=True,help="Datablock directory")
+     parser.add_argument("-d","--dir",default=None,help="Datablock directory")
      parser.add_argument("-n","--dry",action="store_true",help="Dry-run. Do not move or mark damaged elements.")
      parser.add_argument("-a","--fail-after",required=False,default="1d",help="Fail pending backups and orphaned blocks after X time. Default=1d")
      parser.add_argument("-f","--skip-failafter",action="store_true",help="Skip failing pending backups after X time.")

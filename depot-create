@@ -23,7 +23,7 @@ def parse_arguments():
         "Creates a new datastore on an existing, empty folder."
      )
      argparse_logging.add_log_level_argument(parser)
-     parser.add_argument("-d","--dir",required=True,help="Datablock directory")
+     parser.add_argument("-d","--dir",default=None,help="Datablock directory")
      parser.add_argument("-b","--blocksize",required=True,help="Human-readable blocksize in 1024-notation. Suffixes: B|KB|MB|GB|TB")
      args = parser.parse_args()
      return args
