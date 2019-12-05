@@ -7,9 +7,6 @@ Depot-Create - Datastore creator
 import argparse,argparse_logging,humanfriendly,logging,os       #Helpers
 from delib import Delib,DelibDataDir    #Dedup-Server
 
-LOGLEVEL=logging.DEBUG
-logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s', level=LOGLEVEL, datefmt='%Y-%m-%d %H:%M:%S')
-
 
 class DepotCreate(Delib):
 
