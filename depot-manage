@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+
+"""
+Depot-Manage - Datastore and backup manager
+"""
+
+import argparse,argparse_logging,humanfriendly,logging,os,sys       #Helpers
+from delib import Delib,DelibDataDir,DelibBackup    #Dedup-Server
+
+LOGLEVEL=logging.DEBUG
+logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s', level=LOGLEVEL, datefmt='%Y-%m-%d %H:%M:%S')
+
+
+class DepotManage(Delib):
+
+    VERSION = 2019.337 #Year.Yearday
+
+    def __init__(self,dir):
+        self.getData(dir)
+
+    #Return 2d list of all flagged backups
+    def backup_list(self,pending=False,ready=True,failed=False,broken=False,deleted=False):
+        list = {}
+        for state in DelibBackup.ALL_STATES:
+            if locals()["state"]:
+                list[state] = self.data.getBackupsByState(state)
+        return list
+
+    #Show backup list in requested format
+    def show_backup_list(self,output="cli",pending=False,ready=True,failed=False,broken=False,deleted=False):
+        list = self.backup_list(pending=False,ready=True,failed=False,broken=False,deleted=False)
+        if output == "cli":
+            for k in list:
+                print("==> {}".format(k))
+                for entry in list[k]:
+                    print("{}   {}:{}".format(entry["rowid"],entry["host"],entry["name"]))
+        else:
+            out = str(list)
+            out = out.replace("'",'"')
+            print(out)
+
+
+
+def parse_arguments():
+    #Adds a flag for each backup state
+     def add_backup_state_flags(parent):
+        parent.add_argument("-p","--pending",action="store_true",help="Show state_pending")
+        parent.add_argument("-r","--ready",action="store_true",help="Show state_ready")
+        parent.add_argument("-f","--failed",action="store_true",help="Show state_failed")
+        parent.add_argument("-b","--broken",action="store_true",help="Show state_broken")
+        parent.add_argument("-x","--deleted",action="store_true",help="Show state_deleted")
+
+
+     p = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter,description="Manage datastore and backups")
+     argparse_logging.add_log_level_argument(p)
+
+
+     p_ = p.add_subparsers(title='Available modes', dest='mode')
+
+     #Backup
+     p_b = p_.add_parser('backup', help='Backup management mode')
+     p_b_ = p_b.add_subparsers(title="Available backup operations", dest='action')
+     #Backup->Listing
+     p_b_l = p_b_.add_parser("list",help="Backup listing. Defaults to -r")
+     add_backup_state_flags(p_b_l)
+     p_b_l.add_argument("-o","--output",default="cli",help="Set output format. Default=cli. Available=cli,json")
+
+
+
+     p.add_argument("-d","--dir",default=None,help="Datablock directory")
+     args = p.parse_args()
+     #Sanity check: mode and action
+     if not (args.mode and args.action):
+         p.print_help()
+         if not args.mode:
+             logging.error("Missing mode. Try -h")
+         else:
+            logging.error("Missing action. Try -h")
+         sys.exit(2)
+     #Sanity check: generic parameters
+     if args.output and args.output not in ("cli","json"):
+        p.print_help()
+        logging.error("Invalid format. Try -h")
+        sys.exit(2)
+
+     return args
+
+
+if __name__ == "__main__":
+    LOGLEVEL=logging.INFO
+    logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s', level=LOGLEVEL, datefmt='%Y-%m-%d %H:%M:%S')
+    args = parse_arguments()
+
+    manage = DepotManage(args.dir)
+
+    if args.mode == "backup":
+        if args.action == "list":
+            if not args.broken and not args.deleted and not args.failed and not args.pending and not args.ready:
+                args.ready = True
+            list = manage.show_backup_list(output=args.output,broken=args.broken,deleted=args.deleted,failed=args.failed,pending=args.pending,ready=args.ready)
