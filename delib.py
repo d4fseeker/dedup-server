@@ -362,7 +362,11 @@ class DelibDataDir:
 
     #Get list of tuples {host,name} from database, limited by provided state (all states by default)
     def getBackupsByState(self,state=DelibBackup.ALL_STATES):
-        return self.cur.execute("SELECT host,name FROM backups WHERE state = :state",{"state":state}).fetchall()
+        list = []
+        for row in self.cur.execute("SELECT rowid,host,name FROM backups WHERE state = :state",{"state":state}):
+            list.append(dict(row))
+        return list
+
 
     #Get 2d-dict of state -> tuples {host,name} from database
     def getBackups(self):
