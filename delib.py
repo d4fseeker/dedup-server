@@ -440,15 +440,17 @@ class Delib:
     host = None
     name = None
     data = None
+    dir = None
 
-    #Datadir handling
+    #Datadir handling. Assumes CWD if dir is none and not initialized
     def getData(self,dir=None):
-        logging.info("Datastore directory %s",dir)
+        if not self.dir and not self.data:
+            #Assume user wants CWD
+            dir = os.getcwd()
         if dir:
             self.dir = dir
-        if not self.data and not self.dir:
-            raise Exception("dir must be defined on first getData()")
         if not self.data:
+            logging.info("Datastore directory %s",dir)
             self.data = DelibDataDir(dir)
         return self.data
 
