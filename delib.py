@@ -448,7 +448,7 @@ class Delib:
 
     #Datadir handling. Assumes CWD if dir is none and not initialized
     def getData(self,dir=None):
-        if not self.dir and not self.data:
+        if not dir and not self.data:
             #Assume user wants CWD
             dir = os.getcwd()
         if dir:
