@@ -1,5 +1,5 @@
 import sqlite3,re #Server
-import sys,os,stat,io,struct,socket,time,fcntl,glob #Python3 libraries
+import sys,os,stat,io,struct,socket,time,fcntl,glob,shutil #Python3 libraries
 import xxhash,lz4.frame,tarfile #Dedup
 import humanfriendly, logging, math #Helpers
 #from tqdm import tqdm #Progress bar
@@ -198,7 +198,7 @@ class DelibBackup:
         #Verify if backup is db-sane
         if doVerify:
             if not self.verify():
-                raise Exception("Backup failed verification. Marking as {}".format(self.STATE_FAILED))
+                raise Exception("Backup failed verification. Marked as {}".format(self.STATE_FAILED))
         #Mark as done
         self.data.cur.execute("UPDATE backups SET time_imported = :time_imported, state = :state, size = :size WHERE host = :host AND name = :name AND state = :state_pending",{
             "host": host,
@@ -227,28 +227,34 @@ class DelibBackup:
     # - Continuity
     # - Length
     # - If all referenced blocks exist in DB (Not on disk!)
-    def verify_continuity(self,size=None,throw_exception=True):
+    def verify(self,size=None,mark_as_failed=True):
         has_err = False
         if not size:
             size = self.getSize()
-        #Iterate through database
-        iter = self.data.cur.execute("SELECT bl.hash,bb.pos,bb.block,ba.rowid FROM backups ba LEFT JOIN backup_blocks bb ON ba.rowid = bb.backup LEFT JOIN blocks bl ON bb.block = bl.hash WHERE ba.rowid = :backup_id ORDER BY bb.pos ASC",{"backup_id":self.getId()})
-        expect_pos = 1
-        for row in iter:
-            if not row["hash"]:
-                logging.error("Backup %s misses block %s on pos %d",self.getId(),row["block"],expect_pos)
-                has_err = True
-            if row["pos"] != expect_pos:
-                logging.error("Backup %s misses pos %s",self.getId(),expect_pos)
-                has_err = True
-            expect_pos += 1
-        expect_size = (expect_pos-1) * self.data.getBlocksize()
-        if expect_size != size:
+        if not size:
+            logging.error("Backup %s does not have a valid size.",self.getId())
             has_err = True
-            logging.error("Backup is shorter than expected. Is %d, should be %d",expect_size,size)
+        else:
+            #Iterate through database
+            iter = self.data.cur.execute("SELECT bl.hash,bb.pos,bb.block,ba.rowid FROM backups ba LEFT JOIN backup_blocks bb ON ba.rowid = bb.backup LEFT JOIN blocks bl ON bb.block = bl.hash WHERE ba.rowid = :backup_id ORDER BY bb.pos ASC",{"backup_id":self.getId()})
+            expect_pos = 1
+            for row in iter:
+                if not row["hash"]:
+                    logging.error("Backup %s misses block %s on pos %d",self.getId(),row["block"],expect_pos)
+                    has_err = True
+                if row["pos"] != expect_pos:
+                    logging.error("Backup %s misses pos %s",self.getId(),expect_pos)
+                    has_err = True
+                expect_pos += 1
+            expect_size = (expect_pos-1) * self.data.getBlocksize()
+            if expect_size != size:
+                has_err = True
+                logging.error("Backup is shorter than expected. Is %d, should be %d",expect_size,size)
 
-        if throw_exception:
-            raise Exception("Backup {} is damaged!".format(self.getId()))
+        if mark_as_failed and has_err:
+            logging.info("Marking %s:%s as broken",self.row["host"],self.row["name"])
+            self.data.cur.execute("UPDATE backups SET state = 'broken' WHERE host = :host AND name = :name", {'host': self.row["host"], 'name': self.row["name"] } )
+            self.data.db.commit()
         return not has_err
 
 
@@ -332,6 +338,7 @@ class DelibDataDir:
         cur.execute("CREATE TABLE backup_blocks(pos INTEGER,  block NOT NULL REFERENCES blocks, backup NOT NULL REFERENCES backups)")
         #Data and commit
         cur.execute("INSERT INTO settings(key,value) VALUES ('blocksize',:blocksize)",{"blocksize":blocksize})
+        cur.execute("INSERT INTO settings(key,value) VALUES ('last_checked',0)")
         db.commit()
         logging.info("Done creating database")
         #Return created datadir
@@ -379,6 +386,13 @@ class DelibDataDir:
     ## DATABASE-commands
     ##
 
+    #Special: Create a backup copy of the database file
+    def DBBackupFile(self,suffix):
+        db_path = self.dir + "/" + self.DB_NAME
+        backup_path = "{}/{}.{}_{}.bak".format(self.dir,self.DB_NAME,datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),suffix)
+        shutil.copy(db_path,backup_path)
+
+
     #Get full row for block from DB
     def DBGetBlock(self,hash):
         row = self.cur.execute("SELECT * FROM blocks WHERE hash = :hash",{ "hash": hash }).fetchone()
@@ -387,9 +401,9 @@ class DelibDataDir:
         return row
 
     #Get full row for all blocks from DB
-    def DBGetBlocks(self,hash):
+    def DBGetBlocks(self):
         rows = []
-        self.cur.execute("SELECT * FROM blocks ORDER BY hash ASC",{ "hash": hash })
+        self.cur.execute("SELECT * FROM blocks ORDER BY hash ASC")
         for row in self.cur:
             rows.append(row)
         return rows
@@ -432,6 +446,50 @@ class DelibDataDir:
         for file in self.BBgetFiles():
             hash = re.search("^\w+",file)
             hashes.append(hash)
+        return hashes
+
+    #Check for bad blocks in datastore
+    def BBverify(self):
+        bad_blocks = []
+        logging.info("Verifying blocks")
+        for hash in self.getHashes():
+            logging.debug("Verifying %s",hash)
+            try:
+                block = DelibBlock.fromHash(self,hash)
+                if hash != block.getHash(update=True):
+                    logging.error("Block %s failed integrity check. Incorrect hash: %s",hash,block.getHash())
+                    bad_blocks.push(hash)
+            except Exception as e:
+                logging.error("Block %s could not be loaded. %s",hash,str(e))
+                bad_blocks.append(hash)
+        logging.info("Done verifying blocks.")
+        return bad_blocks
+
+    #Move bad blocks to badblock-directory
+    #Either use provided list of hashes or calculate using self.BBverify() if hashes=None
+    #Returns list of newly broken hashes, empty list if none
+    def BBmove(self,hashes=None):
+        if hashes is None:
+            hashes = self.BBverify()
+        logging.warn("Moving %d broken blocks",len(hashes))
+        dst_path = self.dir+"/damaged/"
+        orig_path = self.dir+"/blocks/"
+        for hash in hashes:
+            logging.info("Processing %s",hash)
+            filename = self.DBGetFilename(hash)
+            orig_file = orig_path + filename
+            dst_file = dst_path + filename + str(int(time.time())) + ".broken"
+            #Remove DB entry
+            logging.info("Removing blocks entry in DB")
+            self.db.execute("DELETE FROM blocks WHERE hash = :hash",{"hash": hash})
+            #Move file and finalize with commit
+            if os.path.isfile(orig_file):
+                logging.info("Moving %s to %s",orig_file,dst_file)
+                shutil.move(orig_file,dst_file)
+            else:
+                logging.info("Block %s does not exist. Skipping",orig_file)
+            self.db.commit() #Commit immediately to minimize inconsistenices
+        logging.info("Done moving broken blocks")
         return hashes
 
 

@@ -4,12 +4,17 @@
 Depot-Manage - Datastore and backup manager
 """
 
-import argparse,argparse_logging,humanfriendly,logging,os,sys       #Helpers
+import argparse,argparse_logging,humanfriendly,logging,os,sys,datetime,time       #Helpers
 from delib import Delib,DelibDataDir,DelibBackup    #Dedup-Server
 
 LOGLEVEL=logging.DEBUG
 logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s', level=LOGLEVEL, datefmt='%Y-%m-%d %H:%M:%S')
 
+
+def printjson(out):
+    out = str(out)
+    out = out.replace("'",'"')
+    print(out)
 
 class DepotManage(Delib):
 
@@ -18,20 +23,20 @@ class DepotManage(Delib):
     def __init__(self,dir):
         self.getData(dir)
 
+
     #Return 2d list of all flagged backups
-    def backup_list(self,pending=False,ready=True,failed=False,broken=False,deleted=False):
+    def backup_list(self,states=[]):
         list = {}
-        for state in DelibBackup.ALL_STATES:
-            if locals()["state"]:
-                list[state] = self.data.getBackupsByState(state)
+        for state in states:
+            list[state] = self.data.getBackupsByState(state)
         return list
 
     #Show backup list in requested format
-    def show_backup_list(self,output="cli",pending=False,ready=True,failed=False,broken=False,deleted=False):
-        list = self.backup_list(pending=False,ready=True,failed=False,broken=False,deleted=False)
+    def show_backup_list(self,output="cli",states=[]):
+        list = self.backup_list(states)
         if output == "cli":
             for k in list:
-                print("==> {}".format(k))
+                print("==> {} {}".format(k,len(list[k])))
                 for entry in list[k]:
                     print("{}   {}:{}".format(entry["rowid"],entry["host"],entry["name"]))
         else:
@@ -39,17 +44,198 @@ class DepotManage(Delib):
             out = out.replace("'",'"')
             print(out)
 
+    #Show backup details
+    def show_backup_details(self,param,output="cli"):
+        backup = DelibBackup
+        if not hasattr(param,"id") and not ( hasattr(param,"srchost") and hasattr(param,"name") ):
+            raise Exception("Missing arguments: id or host+name")
+        if hasattr(param,"id"):
+            backup = DelibBackup(data=self.data,id=param.id)
+        else:
+            backup = DelibBackup.fromName(data=self.data,host=param.host,name=param.name)
+
+        if output == "cli":
+            def pad(k,v):
+                print( (k+":").ljust(15," ")+str(v))
+            print("==> Backup #{}".format(backup.getId()))
+            pad("Datadir",os.path.abspath(backup.data.dir))
+            pad("ID",backup.getId())
+            pad("Host",backup.row["host"])
+            pad("Name",backup.row["name"])
+            pad("Device",backup.row["device"])
+            pad("Size",humanfriendly.format_size(backup.getSize(),binary=True))
+            pad("State",backup.row["state"])
+            pad("Created",str(datetime.datetime.fromtimestamp(int(backup.row["time_created"]))))
+            pad("Imported",str(datetime.datetime.fromtimestamp(int(backup.row["time_imported"]))))
+        else:
+            out = str(dict(backup.row))
+            out = out.replace("'",'"')
+            print(out)
+
+    #Show store disk usage
+    def show_store_info(self,output="cli"):
+
+        row = self.data.cur.execute("SELECT COUNT(rowid) AS rows, SUM(size) AS size, SUM(csize) AS csize FROM blocks").fetchone()
+        bb_row = self.data.cur.execute("SELECT COUNT(rowid) AS rows FROM backup_blocks").fetchone()
+        list = [
+            { "k": "datadir", "d": "Datadir","v": os.path.abspath(self.data.dir) },
+            { "k": "block_size", "d": "Block Size", "v": self.data.getBlocksize(), "hfs": True},
+            { "k": "block_count", "d": "Block Count", "v": row["rows"]},
+            { "k": "total_size", "d": "Total size", "v": row["size"], "hfs": True},
+            { "k": "compressed_size", "d": "Compressed", "v": row["csize"], "hfs": True},
+            { "k": "compress_ratio", "d": "Compress Ratio", "v": "1:"+str(round(row["size"]/row["csize"],2)) },
+            { "k": "dedup_orig_size", "d": "Non-Dedup Size", "v": (self.data.getBlocksize()*bb_row["rows"]), "hfs": True },
+            { "k": "dedup_ratio", "d": "Dedup Ratio", "v": "1:"+str(round(bb_row["rows"]/row["rows"],2)) },
+            { "k": "health_state", "d": "Health State", "v": ( "healthy" if self.get_depot_health() else "damaged" ) },
+            { "k": "healt_checked", "d": "Health checked on", "v": ( datetime.datetime.fromtimestamp(self.get_depot_health__lastchecked()) if ( self.get_depot_health__lastchecked() > 0 ) else "never" ) }
+        ]
+
+        if output == "cli":
+            for entry in list:
+                if "hfs" in entry:
+                    v = humanfriendly.format_size(entry["v"],binary=True)
+                else:
+                    v = entry["v"]
+                print( (entry["d"]+":").ljust(20," ")+str(v))
+
+        else:
+            out = {}
+            for entry in list:
+                out[entry["k"]] = entry["v"]
+            printjson(out)
+
+    #Runs all store health checks. May run for some time!
+    def check_store_health(self,output="cli",dry=False):
+        bad_backups=self.check_store_health__backups(dry=dry)
+        bad_blocks=self.check_store_health__blocks(dry=dry)
+        if dry:
+            logging.info("Not updating last-checked in dry mode.")
+        else:
+            logging.info("Updating last-checked")
+            self.data.cur.execute("UPDATE settings SET value = :time WHERE key = 'last_checked'", { 'time': time.time() } )
+            self.data.db.commit()
+
+        if output == "cli":
+            print("==> Bad Backups")
+            if not len(bad_backups):
+                print("No new entries.")
+            else:
+                for backup_ref in bad_backups:
+                    print("{}:{}".format(backup_ref["host"],backup_ref["name"]))
+
+            print("==> Bad Blocks")
+            if not len(bad_blocks):
+                print("No new bad blocks.")
+            else:
+                for bad_block in bad_blocks:
+                    print("{}".format(bad_block))
+        else:
+            out = {
+                "backups": bad_backups,
+                "blocks": bad_blocks
+            }
+            printjson(out)
+
+
+    #Check the DB completeness of all "ready"-state backups. If backup is incomplete, mark as broken
+    #Returns a list of all newly broken backups, empty list if none
+    def check_store_health__backups(self,dry=False):
+        logging.info("Verifying backups")
+        bad_backups = []
+        for backup_ref in self.data.getBackupsByState("ready"):
+            logging.debug("Verifying %s:%s",backup_ref["host"],backup_ref["name"])
+            #Load and verify backup
+            backup = DelibBackup.fromName(data=self.data,host=backup_ref["host"],name=backup_ref["name"])
+            if not backup.verify(mark_as_failed=(not dry)):
+                logging.error("Backup %s:%s failed integrity check.",backup_ref["host"],backup_ref["name"])
+                bad_backups.append(backup_ref)
+        return bad_backups
+
+    #Check datastore for damaged blocks. If hashes are broken, move them to special dir
+    #Returns a list of all newly broken hashes
+    def check_store_health__blocks(self,dry=False):
+        if dry:
+            return self.data.BBverify()
+        else:
+            return self.data.BBmove()
+
+
+    #Query and display existing health status. Does not execut new checks!
+    def get_depot_health(self,skip_check_blocks=False,skip_check_backups=False):
+        is_ok = True
+        if not skip_check_blocks:
+            if not self.get_depot_health__blocks():
+                is_ok = False
+        if not skip_check_backups:
+            if not self.get_depot_health__backups():
+                is_ok = False
+
+        if not is_ok:
+            logging.info("Overall State: damaged")
+            return False
+        else:
+            logging.info("Overall State: healthy")
+            return True
+        return is_ok
+
+    def get_depot_health__lastchecked(self):
+        return float(self.data.db.execute("SELECT value FROM settings WHERE key='last_checked'").fetchone()[0])
+
+    #Query existing bad blocks and return list of bad blocks
+    def get_depot_health__blocks(self):
+        blocks = self.data.BBgetHashes()
+        cnt = len(blocks)
+        if cnt:
+            logging.warn("Have %d damaged blocks",cnt)
+            for block in blocks:
+                logging.info("-> Hash %s",block)
+        else:
+            logging.info("Have zero damaged blocks")
+
+    #Query existing broken backups by running corresponding checks
+    def get_depot_health__backups(self):
+        failed_backups = self.data.getBackupsByState(DelibBackup.STATE_FAILED)
+        if len(failed_backups):
+            logging.warn("Have %d failed backups",len(failed_backups))
+            for failed_backup in failed_backups:
+                logging.info("-> Backup %s:%s",failed_backup["host"],failed_backup["name"])
+        else:
+            logging.info("Have zero failed backups")
+        broken_backups = self.data.getBackupsByState(DelibBackup.STATE_BROKEN)
+        if len(broken_backups):
+            logging.warn("Have %d failed backups",len(broken_backups))
+            for broken_backup in broken_backups:
+                logging.info("-> Backup %s:%s",broken_backup["host"],broken_backup["name"])
+        else:
+            logging.info("Have zero broken backups")
+
+        if len(failed_backups) or len(broken_backups):
+            return False
+        else:
+            return True
+
+
+
+
+
 
 
 def parse_arguments():
-    #Adds a flag for each backup state
-     def add_backup_state_flags(parent):
+     #Adds a flag for each backup state
+     def add_backup_state_flags(parent,add_all=True):
         parent.add_argument("-p","--pending",action="store_true",help="Show state_pending")
         parent.add_argument("-r","--ready",action="store_true",help="Show state_ready")
         parent.add_argument("-f","--failed",action="store_true",help="Show state_failed")
         parent.add_argument("-b","--broken",action="store_true",help="Show state_broken")
         parent.add_argument("-x","--deleted",action="store_true",help="Show state_deleted")
-
+        if add_all:
+            parent.add_argument("-a","--all",action="store_true",help="Show all states")
+     #Adds output parameter
+     def add_output_parameter(parent):
+        parent.add_argument("-o","--output",default="cli",help="Set output format. Default=cli. Available=cli,json")
+     #Adds dry-run parameter
+     def add_dryrun_parameter(parent):
+        parent.add_argument("-s","--dry",action="store_true",help="Dry-run. Simulate execution without changing anything.")
 
      p = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter,description="Manage datastore and backups")
      argparse_logging.add_log_level_argument(p)
@@ -63,7 +249,26 @@ def parse_arguments():
      #Backup->Listing
      p_b_l = p_b_.add_parser("list",help="Backup listing. Defaults to -r")
      add_backup_state_flags(p_b_l)
-     p_b_l.add_argument("-o","--output",default="cli",help="Set output format. Default=cli. Available=cli,json")
+     add_output_parameter(p_b_l)
+     #Backup->Details
+     p_b_s = p_b_.add_parser("show",help="Show backup details.")
+     add_output_parameter(p_b_s)
+     p_b_s.add_argument("-i","--id",default=None,help="Specify backup by ID")
+     p_b_s.add_argument("-s","--host",default=None,help="Specify source host. Use with --name")
+     p_b_s.add_argument("-n","--name",default=None,help="Specify backup name. Use with --host")
+
+     #Store
+     p_s = p_.add_parser('store', help='Datastore management mode')
+     p_s_ = p_s.add_subparsers(title="Available storage operations", dest='action')
+     #Store->Statistics
+     p_s_d = p_s_.add_parser("info",help="Show usage and health statistics.")
+     add_output_parameter(p_s_d)
+     #Store->Healthcheck
+     p_s_h = p_s_.add_parser("check",help="Check current health")
+     add_output_parameter(p_s_h)
+     add_dryrun_parameter(p_s_h)
+
+
 
 
 
@@ -87,14 +292,43 @@ def parse_arguments():
 
 
 if __name__ == "__main__":
-    LOGLEVEL=logging.INFO
+    LOGLEVEL=logging.WARNING
     logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s', level=LOGLEVEL, datefmt='%Y-%m-%d %H:%M:%S')
     args = parse_arguments()
 
     manage = DepotManage(args.dir)
 
     if args.mode == "backup":
+        #List backups by type with optional filters
         if args.action == "list":
-            if not args.broken and not args.deleted and not args.failed and not args.pending and not args.ready:
-                args.ready = True
-            list = manage.show_backup_list(output=args.output,broken=args.broken,deleted=args.deleted,failed=args.failed,pending=args.pending,ready=args.ready)
+            #Check which states are requested, or default to ready
+            states = []
+            for state in DelibBackup.ALL_STATES:
+                if getattr(args,"all") or getattr(args,state):
+                    states.append(state)
+            if not len(states):
+                states.append(DelibBackup.STATE_READY)
+            #Show list
+            list = manage.show_backup_list(output=args.output,states=states)
+        #Show details about a single backup
+        if args.action == "show":
+            manage.show_backup_details(output=args.output,param=args)
+        #Show disk usage details about a single backup
+        if args.action == "disk":
+            ## TODO:
+            pass
+        #Compare disk usage between two backups
+        if args.action == "compare":
+            ## TODO:
+            pass
+
+    if args.mode == "store":
+        #Get disk usage info about datastore
+        if args.action == "info":
+            manage.show_store_info(output=args.output)
+
+        #Get health info about datastore
+        if args.action == "check":
+            if args.dry:
+                logging.info("Dry-run mode")
+            manage.check_store_health(output=args.output,dry=args.dry)
